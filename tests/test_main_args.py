@@ -1,0 +1,36 @@
+import argparse
+
+import pytest
+
+from s1downloader.config import load_config
+from s1downloader.main import _parse_max_results_arg, _parse_track_arg
+
+
+def test_parse_max_results_arg_accepts_integer():
+    assert _parse_max_results_arg("200") == 200
+
+
+def test_parse_max_results_arg_accepts_max_keyword():
+    assert _parse_max_results_arg("max") is None
+
+
+def test_parse_max_results_arg_rejects_invalid():
+    with pytest.raises(argparse.ArgumentTypeError):
+        _parse_max_results_arg("0")
+
+
+def test_parse_track_arg_normalizes_values():
+    assert _parse_track_arg("ascending") == "ASC"
+    assert _parse_track_arg("DES") == "DES"
+
+
+def test_parse_track_arg_rejects_invalid_values():
+    with pytest.raises(argparse.ArgumentTypeError):
+        _parse_track_arg("left")
+
+
+def test_config_allows_max_results_keyword(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("max_results: max\n", encoding="utf-8")
+    config = load_config(project_root=tmp_path, config_path=config_file)
+    assert config.max_results is None

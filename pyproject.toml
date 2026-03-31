@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "s1downloader"
+version = "0.2.0"
+description = "CLI tool for searching and downloading Sentinel-1 SLC data from ASF."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "s1downloader contributors" }]
+keywords = ["sentinel-1", "asf", "remote-sensing", "cli", "download"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Science/Research",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: GIS",
+]
+dependencies = [
+  "asf-search>=10.0.0",
+  "requests>=2.31.0",
+  "PyYAML>=6.0.1",
+  "shapely>=2.0.3",
+  "pyshp>=2.3.1",
+  "matplotlib>=3.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2.0",
+  "ruff>=0.6.0",
+  "tox>=4.20.0",
+  "build>=1.2.2",
+  "twine>=5.1.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/example/s1downloader"
+Repository = "https://github.com/example/s1downloader"
+Issues = "https://github.com/example/s1downloader/issues"
+
+[project.scripts]
+s1downloader = "s1downloader.main:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["s1downloader*", "app*"]
+
+[tool.ruff]
+line-length = 130
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-q"
+testpaths = ["tests"]

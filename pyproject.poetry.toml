@@ -1,0 +1,31 @@
+[tool.poetry]
+name = "s1downloader"
+version = "0.2.0"
+description = "CLI tool for searching and downloading Sentinel-1 SLC data from ASF."
+authors = ["s1downloader contributors"]
+readme = "README.md"
+license = "MIT"
+packages = [{ include = "s1downloader" }, { include = "app" }]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+asf-search = ">=10.0.0"
+requests = ">=2.31.0"
+PyYAML = ">=6.0.1"
+shapely = ">=2.0.3"
+pyshp = ">=2.3.1"
+matplotlib = ">=3.8.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.2.0"
+ruff = ">=0.6.0"
+tox = ">=4.20.0"
+build = ">=1.2.2"
+twine = ">=5.1.1"
+
+[tool.poetry.scripts]
+s1downloader = "s1downloader.main:main"
+
+[build-system]
+requires = ["poetry-core>=1.9.0"]
+build-backend = "poetry.core.masonry.api"

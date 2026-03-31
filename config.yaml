@@ -1,0 +1,5 @@
+manifest_dir: data/manifests
+log_dir: logs
+timeout_sec: 120
+max_results: 200
+log_level: INFO
