@@ -15,6 +15,10 @@ DEFAULT_SEARCH_RETRY_ATTEMPTS = 3
 DEFAULT_SEARCH_RETRY_WAIT_SEC = 2.0
 
 
+class NetworkError(RuntimeError):
+    """Raised when an ASF search or network operation fails."""
+
+
 def _pick(props: dict[str, Any], keys: list[str]) -> Any:
     for key in keys:
         value = props.get(key)
@@ -168,18 +172,19 @@ def search_sentinel1_slc(
             break
         except Exception as exc:
             last_error = exc
-            if attempt >= int(retry_attempts) or not _is_timeout_error(exc):
-                raise
-            logger.warning(
-                "ASF search timeout on attempt %d/%d, retrying in %.1fs: %s",
-                attempt,
-                int(retry_attempts),
-                float(retry_wait_sec),
-                exc,
-            )
-            time.sleep(float(retry_wait_sec))
+            if _is_timeout_error(exc) and attempt < int(retry_attempts):
+                logger.warning(
+                    "ASF search timeout on attempt %d/%d, retrying in %.1fs: %s",
+                    attempt,
+                    int(retry_attempts),
+                    float(retry_wait_sec),
+                    exc,
+                )
+                time.sleep(float(retry_wait_sec))
+                continue
+            raise NetworkError(f"ASF search failed after {attempt} attempt(s): {exc}") from exc
     else:  # pragma: no cover
-        raise RuntimeError(f"ASF search failed unexpectedly: {last_error}")
+        raise NetworkError(f"ASF search failed unexpectedly: {last_error}")
 
     items = [_map_product(product, idx) for idx, product in enumerate(results, start=1)]
 

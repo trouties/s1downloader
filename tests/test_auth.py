@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 
 from s1downloader.auth import load_credentials_from_netrc, validate_credentials, write_netrc_entry
@@ -60,3 +61,21 @@ def test_validate_credentials_uses_direct_session(monkeypatch):
     ok = validate_credentials("u", "p")
     assert ok is True
     assert captured["trust_env"] is False
+
+
+def test_write_netrc_entry_skips_chmod_on_win32(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("s1downloader.auth.sys.platform", "win32")
+    netrc_path = tmp_path / ".netrc"
+    write_netrc_entry("user", "pass", netrc_path=netrc_path)
+    creds = load_credentials_from_netrc(netrc_path=netrc_path)
+    assert creds == ("user", "pass")
+
+
+def test_write_netrc_entry_sets_chmod_on_unix(tmp_path: Path, monkeypatch):
+    if sys.platform == "win32":
+        return  # skip on actual Windows
+    monkeypatch.setattr("s1downloader.auth.sys.platform", "linux")
+    netrc_path = tmp_path / ".netrc"
+    write_netrc_entry("user", "pass", netrc_path=netrc_path)
+    mode = netrc_path.stat().st_mode & 0o777
+    assert mode == 0o600
