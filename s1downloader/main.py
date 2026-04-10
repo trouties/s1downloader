@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import argparse
+import platform
 import sys
+import time
 from datetime import date, datetime
 from pathlib import Path
 
+from s1downloader import __version__
 from s1downloader.aoi import AOIError, normalize_aoi_to_wkt
 from s1downloader.auth import AuthError, get_or_create_credentials
 from s1downloader.config import ensure_directories, load_config
-from s1downloader.download_service import build_download_preview, run_download_from_manifest
+from s1downloader.download_service import build_download_preview, format_bytes, run_download_from_manifest
 from s1downloader.logging_setup import setup_logging
 from s1downloader.manifest import generate_query_id, write_search_manifest
 from s1downloader.models import SearchRequest, SearchResultItem
-from s1downloader.search_service import search_sentinel1_slc
+from s1downloader.search_service import NetworkError, search_sentinel1_slc
 
 EXIT_OK = 0
 EXIT_INPUT_ERROR = 2
@@ -134,6 +137,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to config.yaml (default: project_root/config.yaml)",
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose (DEBUG-level) logging output",
+    )
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -214,8 +223,12 @@ def run_search(args, config, logger) -> int:
         relative_orbit=getattr(args, "relative_orbit", None),
     )
 
+    search_started = time.perf_counter()
     items = search_sentinel1_slc(request, logger)
+    search_elapsed = time.perf_counter() - search_started
+    logger.info("Search completed: %d result(s) in %.1fs", len(items), search_elapsed)
     _print_search_results_table(items)
+    print(f"Search completed: {len(items)} result(s) in {search_elapsed:.1f}s")
 
     query_id = generate_query_id()
     manifest_path = args.manifest_path or _default_search_output_path("csv")
@@ -273,6 +286,8 @@ def run_download(args, config, logger) -> int:
         download_eof=bool(args.eof),
     )
 
+    elapsed_sec = summary.get("elapsed_sec", 0.0)
+    total_bytes = summary.get("total_bytes", 0)
     print("Download completed.")
     print(f"Task ID: {summary['task_id']}")
     print(f"Status manifest: {summary['status_manifest']}")
@@ -283,6 +298,9 @@ def run_download(args, config, logger) -> int:
         f"total={summary['total']}, success={summary['success']}, "
         f"failed={summary['failed']}, skipped={summary['skipped']}"
     )
+    if elapsed_sec > 0:
+        throughput = format_bytes(int(total_bytes / elapsed_sec)) + "ps" if total_bytes > 0 else "N/A"
+        print(f"Elapsed: {elapsed_sec:.1f}s | Downloaded: {format_bytes(total_bytes)} | Avg speed: {throughput}")
     if args.eof:
         print(
             "EOF Summary: "
@@ -295,6 +313,14 @@ def run_download(args, config, logger) -> int:
     return EXIT_OK
 
 
+_ERROR_HINTS: dict[str, str] = {
+    "input": "Run with --verbose for details. Use --help to check argument format.",
+    "auth": "Check your Earthdata credentials at ~/.netrc or re-run to enter them interactively.",
+    "network": "Run with --verbose for a full traceback. Check network connectivity.",
+    "file": "Check file permissions and available disk space.",
+}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -303,7 +329,19 @@ def main(argv: list[str] | None = None) -> int:
     config = load_config(project_root=project_root, config_path=args.config)
     ensure_directories(config)
 
-    logger = setup_logging(config.log_dir, config.log_level)
+    log_level = "DEBUG" if getattr(args, "verbose", False) else config.log_level
+    logger = setup_logging(config.log_dir, log_level)
+
+    logger.debug(
+        "s1downloader %s | Python %s | %s %s (%s)",
+        __version__,
+        sys.version.split()[0],
+        platform.system(),
+        platform.release(),
+        platform.machine(),
+    )
+    if platform.system() == "Windows":
+        logger.warning("Native Windows is not officially supported. Consider using WSL.")
 
     try:
         if args.command == "search":
@@ -314,18 +352,27 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, AOIError) as exc:
         logger.error("Input error: %s", exc)
         print(f"Input error: {exc}", file=sys.stderr)
+        print(f"Hint: {_ERROR_HINTS['input']}", file=sys.stderr)
         return EXIT_INPUT_ERROR
     except AuthError as exc:
         logger.error("Auth error: %s", exc)
         print(f"Auth error: {exc}", file=sys.stderr)
+        print(f"Hint: {_ERROR_HINTS['auth']}", file=sys.stderr)
         return EXIT_AUTH_ERROR
+    except NetworkError as exc:
+        logger.error("Network/API error: %s", exc)
+        print(f"Network/API error: {exc}", file=sys.stderr)
+        print(f"Hint: {_ERROR_HINTS['network']}", file=sys.stderr)
+        return EXIT_NETWORK_OR_API_ERROR
     except OSError as exc:
         logger.error("File error: %s", exc)
         print(f"File error: {exc}", file=sys.stderr)
+        print(f"Hint: {_ERROR_HINTS['file']}", file=sys.stderr)
         return EXIT_FILE_ERROR
     except Exception as exc:  # pragma: no cover
-        logger.exception("Unexpected network/API error")
-        print(f"Network/API error: {exc}", file=sys.stderr)
+        logger.exception("Unexpected error")
+        print(f"Unexpected error: {exc}", file=sys.stderr)
+        print(f"Hint: {_ERROR_HINTS['network']}", file=sys.stderr)
         return EXIT_NETWORK_OR_API_ERROR
 
 
