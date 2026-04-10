@@ -21,8 +21,7 @@
 ## Requirements | 环境要求
 
 - Python `3.10` / `3.11` / `3.12`
-- Officially tested: Linux / WSL
-- macOS: likely compatible but not fully verified in CI yet
+- Officially tested in CI: Linux, macOS
 - Native Windows: use WSL recommended (not officially supported yet)
 
 ## Install | 安装

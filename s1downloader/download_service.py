@@ -151,7 +151,7 @@ def _match_eof_name(entries: list[_EOFEntry], satellite: str, scene_time: dateti
     return candidates[-1].name
 
 
-def _format_bytes(num_bytes: int | None) -> str:
+def format_bytes(num_bytes: int | None) -> str:
     if num_bytes is None:
         return "?"
     value = float(num_bytes)
@@ -181,14 +181,14 @@ def _render_live_line(
         filled = int(ratio * _LIVE_BAR_WIDTH)
         bar = "#" * filled + "-" * (_LIVE_BAR_WIDTH - filled)
         pct = f"{int(ratio * 100):>3d}%"
-        size_text = f"{_format_bytes(downloaded_bytes)}/{_format_bytes(total_bytes)}"
+        size_text = f"{format_bytes(downloaded_bytes)}/{format_bytes(total_bytes)}"
     else:
         bar = "#" * min(_LIVE_BAR_WIDTH, max(1, (downloaded_bytes // (1024 * 1024)) % (_LIVE_BAR_WIDTH + 1)))
         bar = bar.ljust(_LIVE_BAR_WIDTH, "-")
         pct = " --%"
-        size_text = f"{_format_bytes(downloaded_bytes)}/?"
+        size_text = f"{format_bytes(downloaded_bytes)}/?"
 
-    speed_text = f"{_format_bytes(int(max(speed_bps, 0.0)))}ps"
+    speed_text = f"{format_bytes(int(max(speed_bps, 0.0)))}ps"
     return f"[{item_no}/{total_items}] [{bar}] {pct} {size_text} {speed_text} (ok={success}, skip={skipped}, fail={failed})"
 
 
@@ -535,6 +535,8 @@ def run_download_from_manifest(
 
     username, password = credentials
 
+    run_started = time.perf_counter()
+    total_downloaded_bytes = 0
     summary = {
         "task_id": task_id,
         "status_manifest": str(status_manifest_path),
@@ -729,6 +731,8 @@ def run_download_from_manifest(
 
                         if status == "success":
                             summary["success"] += 1
+                            if target_path.exists():
+                                total_downloaded_bytes += target_path.stat().st_size
                         else:
                             summary["failed"] += 1
                             failed_rows.append(
@@ -794,5 +798,8 @@ def run_download_from_manifest(
     if failed_rows:
         write_failed_manifest(failed_manifest_path, failed_rows)
         summary["failed_manifest"] = str(failed_manifest_path)
+
+    summary["elapsed_sec"] = round(time.perf_counter() - run_started, 2)
+    summary["total_bytes"] = total_downloaded_bytes
 
     return summary

@@ -3,7 +3,7 @@ import argparse
 import pytest
 
 from s1downloader.config import load_config
-from s1downloader.main import _parse_max_results_arg, _parse_track_arg
+from s1downloader.main import _parse_max_results_arg, _parse_track_arg, build_parser
 
 
 def test_parse_max_results_arg_accepts_integer():
@@ -34,3 +34,15 @@ def test_config_allows_max_results_keyword(tmp_path):
     config_file.write_text("max_results: max\n", encoding="utf-8")
     config = load_config(project_root=tmp_path, config_path=config_file)
     assert config.max_results is None
+
+
+def test_verbose_flag_accepted_by_parser():
+    parser = build_parser()
+    args = parser.parse_args(["-v", "search", "-s", "20240101", "-e", "20240131", "--bbox", "1,2,3,4"])
+    assert args.verbose is True
+
+
+def test_verbose_flag_defaults_to_false():
+    parser = build_parser()
+    args = parser.parse_args(["search", "-s", "20240101", "-e", "20240131", "--bbox", "1,2,3,4"])
+    assert args.verbose is False
