@@ -235,6 +235,7 @@ def test_run_download_from_manifest_writes_failed_manifest(tmp_path: Path, monke
         credentials=("u", "p"),
         logger=logging.getLogger("test.download.flow"),
         show_progress=False,
+        workers=1,
     )
 
     assert summary["total"] == 2
@@ -261,28 +262,11 @@ def test_run_download_from_manifest_uses_direct_session(tmp_path: Path, monkeypa
 
     captured = {"trust_env": None}
 
-    class _FakeSession:
-        def __init__(self, username, password):
-            self.auth = (username, password)
-            self.trust_env = False
+    def _fake_download_file(session, url, target_path, timeout_sec, progress_hook=None):
+        captured["trust_env"] = session.trust_env
+        target_path.write_bytes(b"ok")
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-    monkeypatch.setattr("s1downloader.download_service._EarthdataSession", _FakeSession)
-
-    def _fake_download_with_retries(**kwargs):
-        captured["trust_env"] = kwargs["session"].trust_env
-        return type(
-            "Attempt",
-            (),
-            {"status": "success", "attempt": 1, "error": "", "error_type": ""},
-        )()
-
-    monkeypatch.setattr("s1downloader.download_service._download_with_retries", _fake_download_with_retries)
+    monkeypatch.setattr("s1downloader.download_service._download_file", _fake_download_file)
 
     summary = run_download_from_manifest(
         manifest_path=manifest_path,
@@ -293,6 +277,7 @@ def test_run_download_from_manifest_uses_direct_session(tmp_path: Path, monkeypa
         credentials=("u", "p"),
         logger=logging.getLogger("test.download.direct_session"),
         show_progress=False,
+        workers=1,
     )
 
     assert summary["success"] == 1
@@ -402,10 +387,11 @@ def test_run_download_with_eof_for_success_and_skipped_items(tmp_path: Path, mon
         ],
     )
 
-    monkeypatch.setattr(
-        "s1downloader.download_service._download_with_retries",
-        lambda **kwargs: type("Attempt", (), {"status": "success", "attempt": 1, "error": "", "error_type": ""})(),
-    )
+    def _fake_download_file(session, url, target_path, timeout_sec, progress_hook=None):
+        target_path.write_bytes(b"ok")
+
+    monkeypatch.setattr("s1downloader.download_service._download_file", _fake_download_file)
+
     eof_calls = {"count": 0}
 
     def _fake_download_eof(**kwargs):
@@ -425,6 +411,7 @@ def test_run_download_with_eof_for_success_and_skipped_items(tmp_path: Path, mon
         logger=logging.getLogger("test.download.with_eof"),
         show_progress=False,
         download_eof=True,
+        workers=1,
     )
 
     assert summary["success"] == 1
@@ -485,6 +472,7 @@ def test_run_download_with_eof_skips_existing_orbit_file(tmp_path: Path, monkeyp
         logger=logging.getLogger("test.download.eof.skip_existing"),
         show_progress=False,
         download_eof=True,
+        workers=1,
     )
 
     assert summary["skipped"] == 1

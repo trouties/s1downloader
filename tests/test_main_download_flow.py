@@ -24,6 +24,7 @@ def test_run_download_uses_explicit_output_dir(tmp_path, monkeypatch):
         download_dir=output_dir,
         track=None,
         eof=False,
+        workers=None,
     )
     logger = logging.getLogger("test.main.download.output")
 
@@ -61,6 +62,7 @@ def test_run_download_defaults_to_pwd_dataset(tmp_path, monkeypatch):
         download_dir=None,
         track=None,
         eof=False,
+        workers=None,
     )
     logger = logging.getLogger("test.main.download.default")
 
@@ -99,6 +101,7 @@ def test_run_download_returns_nonzero_when_failed_items_exist(tmp_path, monkeypa
         download_dir=None,
         track=None,
         eof=False,
+        workers=None,
     )
     logger = logging.getLogger("test.main.download.fail")
 
@@ -134,6 +137,7 @@ def test_run_download_passes_eof_flag_and_prints_eof_summary(tmp_path, monkeypat
         download_dir=None,
         track=None,
         eof=True,
+        workers=None,
     )
     logger = logging.getLogger("test.main.download.eof")
 
