@@ -4,8 +4,10 @@ import logging
 import re
 import shutil
 import sys
+import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -71,6 +73,116 @@ class _EarthdataSession(requests.Session):
             prepared_request.prepare_auth(self.auth, prepared_request.url)
             return
         super().rebuild_auth(prepared_request, response)
+
+
+@dataclass
+class _DownloadResult:
+    item: SearchResultItem
+    target_path: Path
+    status: str
+    attempt: int
+    error: str
+    error_type: str
+    elapsed_sec: float
+    file_size: int
+
+
+class _SessionPool:
+    """Thread-local pool of _EarthdataSession instances."""
+
+    def __init__(self, username: str, password: str):
+        self._username = username
+        self._password = password
+        self._local = threading.local()
+        self._sessions: list[_EarthdataSession] = []
+        self._lock = threading.Lock()
+
+    def get(self) -> _EarthdataSession:
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = _EarthdataSession(self._username, self._password)
+            self._local.session = session
+            with self._lock:
+                self._sessions.append(session)
+        return session
+
+    def close_all(self) -> None:
+        with self._lock:
+            for s in self._sessions:
+                s.close()
+            self._sessions.clear()
+
+
+class _ProgressAggregator:
+    """Thread-safe aggregate progress display for parallel downloads."""
+
+    def __init__(self, total_items: int, show_progress: bool):
+        self._lock = threading.Lock()
+        self._total_items = total_items
+        self._show = show_progress
+        self._completed = 0
+        self._success = 0
+        self._failed = 0
+        self._skipped = 0
+        self._active: dict[str, tuple[int, int | None]] = {}
+        self._last_update = 0.0
+        self._line_width = 0
+
+    def on_item_progress(self, granule_id: str, downloaded: int, total_bytes: int | None) -> None:
+        with self._lock:
+            self._active[granule_id] = (downloaded, total_bytes)
+            self._maybe_refresh()
+
+    def on_item_complete(self, result: _DownloadResult) -> None:
+        with self._lock:
+            self._active.pop(result.item.granule_id, None)
+            self._completed += 1
+            if result.status == "success":
+                self._success += 1
+            elif result.status == "skipped":
+                self._skipped += 1
+            else:
+                self._failed += 1
+
+    def _maybe_refresh(self) -> None:
+        now = time.perf_counter()
+        if now - self._last_update < _LIVE_REFRESH_INTERVAL_SEC:
+            return
+        self._refresh()
+
+    def _refresh(self) -> None:
+        if not self._show:
+            return
+        self._last_update = time.perf_counter()
+        active_count = len(self._active)
+        total_active_bytes = sum(d for d, _ in self._active.values())
+        line = (
+            f"[{self._completed}/{self._total_items}] "
+            f"active={active_count} "
+            f"downloading={format_bytes(total_active_bytes)} "
+            f"(ok={self._success}, skip={self._skipped}, fail={self._failed})"
+        )
+        term_width = shutil.get_terminal_size(fallback=(120, 20)).columns
+        if term_width > 4 and len(line) > term_width - 1:
+            line = line[: term_width - 1]
+        padded = line
+        if self._line_width > len(line):
+            padded = line + " " * (self._line_width - len(line))
+        self._line_width = max(self._line_width, len(line))
+        print(padded, end="\r", flush=True, file=sys.stdout)
+
+    def print_item_summary(self, result: _DownloadResult, eof_note: str) -> None:
+        if not self._show:
+            return
+        with self._lock:
+            print(
+                f"\n[{self._completed}/{self._total_items}] "
+                f"{result.item.granule_id[:60]} "
+                f"SLC={result.status.upper()} | {eof_note} | "
+                f"ok={self._success} skip={self._skipped} fail={self._failed}",
+                file=sys.stdout,
+                flush=True,
+            )
 
 
 def _parse_compact_utc(text: str) -> datetime:
@@ -429,6 +541,105 @@ def _download_url_with_retries(
     return _AttemptResult(status="failed", attempt=max_attempts, error_type="unknown_error")
 
 
+def _download_one_item(
+    *,
+    session_pool: _SessionPool,
+    item: SearchResultItem,
+    download_root: Path,
+    timeout_sec: int,
+    logger: logging.Logger,
+    progress: _ProgressAggregator | None = None,
+    shutdown_event: threading.Event | None = None,
+) -> _DownloadResult:
+    """Download a single item in a worker thread. Does not mutate shared state."""
+    started = time.perf_counter()
+    target_path = _build_target_path(download_root, item)
+    try:
+        if shutdown_event is not None and shutdown_event.is_set():
+            return _DownloadResult(
+                item=item,
+                target_path=target_path,
+                status="cancelled",
+                attempt=0,
+                error="",
+                error_type="",
+                elapsed_sec=0.0,
+                file_size=0,
+            )
+
+        if not item.download_url:
+            raise ValueError("Missing download_url in search manifest")
+
+        if target_path.exists():
+            _cleanup_part_file(target_path)
+            return _DownloadResult(
+                item=item,
+                target_path=target_path,
+                status="skipped",
+                attempt=0,
+                error="",
+                error_type="",
+                elapsed_sec=time.perf_counter() - started,
+                file_size=0,
+            )
+
+        session = session_pool.get()
+        granule_id = item.granule_id
+        logger.debug("Downloading [%s] -> %s", granule_id, target_path)
+
+        on_progress = None
+        if progress is not None:
+
+            def on_progress(
+                downloaded: int,
+                total_bytes: int | None,
+                _elapsed: float,
+                *,
+                _gid: str = granule_id,
+                _prog: _ProgressAggregator = progress,
+            ) -> None:
+                _prog.on_item_progress(_gid, downloaded, total_bytes)
+
+        result = _download_with_retries(
+            session=session,
+            item=item,
+            target_path=target_path,
+            timeout_sec=timeout_sec,
+            logger=logger,
+            max_attempts=MAX_DOWNLOAD_ATTEMPTS,
+            on_progress=on_progress,
+        )
+
+        file_size = 0
+        if result.status == "success" and target_path.exists():
+            file_size = target_path.stat().st_size
+
+        return _DownloadResult(
+            item=item,
+            target_path=target_path,
+            status=result.status,
+            attempt=result.attempt,
+            error=result.error,
+            error_type=result.error_type,
+            elapsed_sec=time.perf_counter() - started,
+            file_size=file_size,
+        )
+    except Exception as exc:
+        error_text = str(exc)
+        error_type, _ = _classify_download_exception(exc)
+        logger.exception("Download failed for %s", item.granule_id)
+        return _DownloadResult(
+            item=item,
+            target_path=target_path,
+            status="failed",
+            attempt=1,
+            error=error_text,
+            error_type=error_type,
+            elapsed_sec=time.perf_counter() - started,
+            file_size=0,
+        )
+
+
 def _normalize_track_tokens(text: str | None) -> set[str]:
     if not text:
         return set()
@@ -512,6 +723,7 @@ def run_download_from_manifest(
     logger: logging.Logger,
     show_progress: bool = True,
     download_eof: bool = False,
+    workers: int = 4,
 ) -> dict[str, object]:
     items = read_search_manifest(manifest_path)
     selected_items = list(items)
@@ -537,7 +749,7 @@ def run_download_from_manifest(
 
     run_started = time.perf_counter()
     total_downloaded_bytes = 0
-    summary = {
+    summary: dict[str, object] = {
         "task_id": task_id,
         "status_manifest": str(status_manifest_path),
         "failed_manifest": "",
@@ -551,246 +763,137 @@ def run_download_from_manifest(
         "eof_failed": 0,
     }
     failed_rows: list[dict[str, str]] = []
-    live_line_width = 0
-    last_live_update_ts = 0.0
-    orbit_dir = (Path.cwd() / "Orbit") if download_eof else None
-    eof_entries: list[_EOFEntry] | None = None
-    eof_index_error: str | None = None
-    eof_seen_names: set[str] = set()
+    total_items = len(selected_items)
+    effective_workers = min(max(workers, 1), total_items)
 
-    if orbit_dir is not None:
-        orbit_dir.mkdir(parents=True, exist_ok=True)
+    # -- Phase 1: parallel SLC downloads --
+    session_pool = _SessionPool(username, password)
+    progress = _ProgressAggregator(total_items, show_progress)
+    shutdown_event = threading.Event()
+    completed_results: list[_DownloadResult] = []
 
-    def _print_live_line(text: str, *, force: bool = False) -> None:
-        nonlocal live_line_width, last_live_update_ts
-        now = time.perf_counter()
-        if (not force) and (now - last_live_update_ts < _LIVE_REFRESH_INTERVAL_SEC):
-            return
-        last_live_update_ts = now
-
-        term_width = shutil.get_terminal_size(fallback=(120, 20)).columns
-        shown = text
-        if term_width > 4 and len(shown) > term_width - 1:
-            shown = shown[: term_width - 1]
-
-        padded = shown
-        if live_line_width > len(shown):
-            padded = shown + (" " * (live_line_width - len(shown)))
-        live_line_width = max(live_line_width, len(shown))
-        print(padded, end="\r", flush=True, file=sys.stdout)
-
-    processed = 0
-
-    def _maybe_download_eof(item: SearchResultItem, eof_session: requests.Session) -> str:
-        nonlocal eof_entries, eof_index_error
-
-        parsed = _parse_scene_satellite_and_time(item)
-        if parsed is None:
-            summary["eof_failed"] += 1
-            logger.warning("EOF skip: unable to parse satellite/acquisition time for %s", item.granule_id)
-            return "EOF: parse_failed"
-
-        satellite, scene_time = parsed
-        if eof_entries is None and eof_index_error is None:
+    try:
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+            futures = {
+                executor.submit(
+                    _download_one_item,
+                    session_pool=session_pool,
+                    item=item,
+                    download_root=download_root,
+                    timeout_sec=timeout_sec,
+                    logger=logger,
+                    progress=progress if show_progress else None,
+                    shutdown_event=shutdown_event,
+                ): item
+                for item in selected_items
+            }
             try:
-                eof_entries = _fetch_eof_entries(timeout_sec=timeout_sec, logger=logger)
-            except Exception as exc:
-                eof_index_error = str(exc)
-                logger.warning("EOF index fetch failed: %s", exc)
+                for future in as_completed(futures):
+                    result = future.result()
+                    completed_results.append(result)
+                    progress.on_item_complete(result)
 
-        if eof_index_error is not None:
-            summary["eof_failed"] += 1
-            return "EOF: index_failed"
+                    # Write CSV status record (main thread only)
+                    record = DownloadStatusRecord(
+                        task_id=task_id,
+                        granule_id=result.item.granule_id,
+                        status=result.status,
+                        local_path=str(result.target_path),
+                        error=result.error,
+                        elapsed_sec=result.elapsed_sec,
+                        timestamp=utc_now_iso(),
+                        attempt=result.attempt,
+                        error_type=result.error_type,
+                    )
+                    append_download_status(status_manifest_path, record)
 
-        assert eof_entries is not None
-        eof_name = _match_eof_name(eof_entries, satellite, scene_time)
-        if not eof_name:
-            summary["eof_failed"] += 1
-            logger.warning("EOF match not found for %s (%s %s)", item.granule_id, satellite, scene_time.isoformat())
-            return "EOF: no_match"
-
-        if eof_name in eof_seen_names:
-            return f"EOF: reused {eof_name}"
-
-        eof_seen_names.add(eof_name)
-        assert orbit_dir is not None
-        eof_target = orbit_dir / eof_name
-        if eof_target.exists():
-            summary["eof_skipped"] += 1
-            return f"EOF: exists {eof_name}"
-
-        result = _download_url_with_retries(
-            session=eof_session,
-            url=f"{_EOF_INDEX_URL}/{eof_name}",
-            target_path=eof_target,
-            timeout_sec=timeout_sec,
-            logger=logger,
-            label=eof_name,
-            max_attempts=MAX_DOWNLOAD_ATTEMPTS,
-            retry_auth_errors=True,
-        )
-        if result.status == "success":
-            summary["eof_success"] += 1
-            return f"EOF: downloaded {eof_name}"
-        else:
-            summary["eof_failed"] += 1
-            return f"EOF: failed {eof_name}"
-
-    with _EarthdataSession(username, password) as session:
-        eof_session = session if download_eof else None
-        total_items = len(selected_items)
-        try:
-            for item_no, item in enumerate(selected_items, start=1):
-                started = time.perf_counter()
-                target_path = _build_target_path(download_root, item)
-                full_label = (item.granule_id or "").strip() or "unknown"
-
-                if show_progress:
-                    print(f"\nScene [{item_no}/{total_items}]: {full_label}", file=sys.stdout, flush=True)
-
-                status = "pending"
-                error = ""
-                error_type = ""
-                attempt = 0
-                live_used = {"value": False}
-
-                try:
-                    if not item.download_url:
-                        raise ValueError("Missing download_url in search manifest")
-
-                    if target_path.exists():
-                        status = "skipped"
-                        attempt = 0
-                        summary["skipped"] += 1
-                        _cleanup_part_file(target_path)
-                    else:
-                        logger.debug("Downloading [%s] -> %s", full_label, target_path)
-
-                        def _on_attempt(
-                            _current_attempt: int,
-                            *,
-                            _live_used: dict[str, bool] = live_used,
-                            _item_no: int = item_no,
-                            _total_items: int = total_items,
-                        ) -> None:
-                            if not show_progress:
-                                return
-                            _live_used["value"] = True
-                            _print_live_line(
-                                _render_live_line(
-                                    item_no=_item_no,
-                                    total_items=_total_items,
-                                    success=summary["success"],
-                                    failed=summary["failed"],
-                                    skipped=summary["skipped"],
-                                    downloaded_bytes=0,
-                                    total_bytes=None,
-                                    speed_bps=0.0,
-                                ),
-                                force=True,
-                            )
-
-                        progress_callback = None
-                        if show_progress:
-
-                            def progress_callback(
-                                downloaded: int,
-                                total_bytes: int | None,
-                                elapsed: float,
-                                *,
-                                _item_no: int = item_no,
-                                _total_items: int = total_items,
-                            ) -> None:
-                                _print_live_line(
-                                    _render_live_line(
-                                        item_no=_item_no,
-                                        total_items=_total_items,
-                                        success=summary["success"],
-                                        failed=summary["failed"],
-                                        skipped=summary["skipped"],
-                                        downloaded_bytes=downloaded,
-                                        total_bytes=total_bytes,
-                                        speed_bps=(0.0 if elapsed <= 0 else downloaded / elapsed),
-                                    )
-                                )
-
-                        result = _download_with_retries(
-                            session=session,
-                            item=item,
-                            target_path=target_path,
-                            timeout_sec=timeout_sec,
-                            logger=logger,
-                            max_attempts=MAX_DOWNLOAD_ATTEMPTS,
-                            on_attempt=_on_attempt,
-                            on_progress=progress_callback,
+                    # Update summary counters (main thread only)
+                    if result.status == "success":
+                        summary["success"] = int(summary["success"]) + 1
+                        total_downloaded_bytes += result.file_size
+                    elif result.status == "skipped":
+                        summary["skipped"] = int(summary["skipped"]) + 1
+                    elif result.status != "cancelled":
+                        summary["failed"] = int(summary["failed"]) + 1
+                        failed_rows.append(
+                            {
+                                "granule_id": result.item.granule_id,
+                                "download_url": result.item.download_url,
+                                "reason": result.error or result.error_type or "download failed",
+                            }
                         )
-                        status = result.status
-                        attempt = result.attempt
-                        error = result.error
-                        error_type = result.error_type
 
-                        if status == "success":
-                            summary["success"] += 1
-                            if target_path.exists():
-                                total_downloaded_bytes += target_path.stat().st_size
-                        else:
-                            summary["failed"] += 1
-                            failed_rows.append(
-                                {
-                                    "granule_id": item.granule_id,
-                                    "download_url": item.download_url,
-                                    "reason": error or error_type or "download failed",
-                                }
-                            )
-                except Exception as exc:
-                    status = "failed"
-                    error = str(exc)
-                    error_type, _ = _classify_download_exception(exc)
-                    attempt = max(attempt, 1)
-                    summary["failed"] += 1
-                    failed_rows.append(
-                        {
-                            "granule_id": item.granule_id,
-                            "download_url": item.download_url,
-                            "reason": error or error_type or "download failed",
-                        }
+                    eof_note = "EOF: deferred" if download_eof else "EOF: off"
+                    progress.print_item_summary(result, eof_note)
+            except KeyboardInterrupt:
+                shutdown_event.set()
+                logger.warning("Download interrupted by user, finishing active downloads...")
+    finally:
+        session_pool.close_all()
+
+    # -- Phase 2: sequential EOF downloads --
+    if download_eof:
+        orbit_dir = Path.cwd() / "Orbit"
+        orbit_dir.mkdir(parents=True, exist_ok=True)
+        eof_entries: list[_EOFEntry] | None = None
+        eof_index_error: str | None = None
+        eof_seen_names: set[str] = set()
+
+        with _EarthdataSession(username, password) as eof_session:
+            for result in completed_results:
+                if result.status not in {"success", "skipped"}:
+                    continue
+
+                parsed = _parse_scene_satellite_and_time(result.item)
+                if parsed is None:
+                    summary["eof_failed"] = int(summary["eof_failed"]) + 1
+                    logger.warning("EOF skip: unable to parse satellite/acquisition time for %s", result.item.granule_id)
+                    continue
+
+                satellite, scene_time = parsed
+                if eof_entries is None and eof_index_error is None:
+                    try:
+                        eof_entries = _fetch_eof_entries(timeout_sec=timeout_sec, logger=logger)
+                    except Exception as exc:
+                        eof_index_error = str(exc)
+                        logger.warning("EOF index fetch failed: %s", exc)
+
+                if eof_index_error is not None:
+                    summary["eof_failed"] = int(summary["eof_failed"]) + 1
+                    continue
+
+                assert eof_entries is not None
+                eof_name = _match_eof_name(eof_entries, satellite, scene_time)
+                if not eof_name:
+                    summary["eof_failed"] = int(summary["eof_failed"]) + 1
+                    logger.warning(
+                        "EOF match not found for %s (%s %s)", result.item.granule_id, satellite, scene_time.isoformat()
                     )
-                    logger.exception("Download failed for %s", item.granule_id)
+                    continue
 
-                elapsed = time.perf_counter() - started
-                record = DownloadStatusRecord(
-                    task_id=task_id,
-                    granule_id=item.granule_id,
-                    status=status,
-                    local_path=str(target_path),
-                    error=error,
-                    elapsed_sec=elapsed,
-                    timestamp=utc_now_iso(),
-                    attempt=attempt,
-                    error_type=error_type,
+                if eof_name in eof_seen_names:
+                    continue
+
+                eof_seen_names.add(eof_name)
+                eof_target = orbit_dir / eof_name
+                if eof_target.exists():
+                    summary["eof_skipped"] = int(summary["eof_skipped"]) + 1
+                    continue
+
+                eof_result = _download_url_with_retries(
+                    session=eof_session,
+                    url=f"{_EOF_INDEX_URL}/{eof_name}",
+                    target_path=eof_target,
+                    timeout_sec=timeout_sec,
+                    logger=logger,
+                    label=eof_name,
+                    max_attempts=MAX_DOWNLOAD_ATTEMPTS,
+                    retry_auth_errors=True,
                 )
-                append_download_status(status_manifest_path, record)
-                processed += 1
-
-                eof_note = "EOF: off"
-                if download_eof and eof_session is not None and status in {"success", "skipped"}:
-                    eof_note = _maybe_download_eof(item, eof_session)
-                elif download_eof and status == "failed":
-                    eof_note = "EOF: skipped (SLC failed)"
-
-                if show_progress and status in {"success", "skipped", "failed"}:
-                    if live_used["value"]:
-                        print(file=sys.stdout)
-                    print(
-                        f"[{processed}/{total_items}] "
-                        f"SLC={status.upper()} | {eof_note} | "
-                        f"ok={summary['success']} skip={summary['skipped']} fail={summary['failed']}",
-                        file=sys.stdout,
-                        flush=True,
-                    )
-        finally:
-            if eof_session is not None and eof_session is not session:
-                eof_session.close()
+                if eof_result.status == "success":
+                    summary["eof_success"] = int(summary["eof_success"]) + 1
+                else:
+                    summary["eof_failed"] = int(summary["eof_failed"]) + 1
 
     if show_progress and selected_items:
         print(file=sys.stdout)

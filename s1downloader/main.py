@@ -197,6 +197,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Also download matching Sentinel-1 EOF files into ./Orbit",
     )
+    download.add_argument(
+        "-w",
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of parallel download workers (default: from config, typically 4)",
+    )
 
     return parser
 
@@ -260,6 +267,10 @@ def run_search(args, config, logger) -> int:
 def run_download(args, config, logger) -> int:
     credentials = get_or_create_credentials(logger=logger, interactive=sys.stdin.isatty())
 
+    workers = args.workers if args.workers is not None else config.workers
+    if workers < 1:
+        raise ValueError("--workers must be at least 1")
+
     download_dir = args.download_dir or (Path.cwd() / "dataset")
     download_dir.mkdir(parents=True, exist_ok=True)
     preview = build_download_preview(manifest_path=args.manifest, track_filter=args.track)
@@ -271,7 +282,7 @@ def run_download(args, config, logger) -> int:
     print(f"- Track filter: {track_text}")
     print(f"- Items in manifest: {preview['manifest_total']}")
     print(f"- Items to process: {preview['filtered_total']}")
-    print("- Progress: a single live progress line will be shown below")
+    print(f"- Workers: {workers}")
     print(f"- EOF download: {'ON (./Orbit)' if args.eof else 'OFF'}")
 
     summary = run_download_from_manifest(
@@ -284,6 +295,7 @@ def run_download(args, config, logger) -> int:
         logger=logger,
         show_progress=True,
         download_eof=bool(args.eof),
+        workers=workers,
     )
 
     elapsed_sec = summary.get("elapsed_sec", 0.0)

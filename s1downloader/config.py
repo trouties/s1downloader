@@ -15,6 +15,7 @@ class AppConfig:
     timeout_sec: int = 120
     max_results: int | None = 200
     log_level: str = "INFO"
+    workers: int = 4
 
 
 DEFAULT_CONFIG_FILE = "config.yaml"
@@ -52,6 +53,10 @@ def load_config(project_root: Path, config_path: Path | None) -> AppConfig:
     if timeout_sec <= 0:
         raise ValueError("config timeout_sec must be a positive integer")
 
+    workers = int(data.get("workers", 4))
+    if workers < 1:
+        raise ValueError("config workers must be a positive integer")
+
     return AppConfig(
         project_root=project_root,
         manifest_dir=manifest_dir,
@@ -59,6 +64,7 @@ def load_config(project_root: Path, config_path: Path | None) -> AppConfig:
         timeout_sec=timeout_sec,
         max_results=max_results,
         log_level=str(data.get("log_level", "INFO")).upper(),
+        workers=workers,
     )
 
 

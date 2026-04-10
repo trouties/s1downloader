@@ -46,3 +46,29 @@ def test_verbose_flag_defaults_to_false():
     parser = build_parser()
     args = parser.parse_args(["search", "-s", "20240101", "-e", "20240131", "--bbox", "1,2,3,4"])
     assert args.verbose is False
+
+
+def test_workers_flag_accepted_by_parser():
+    parser = build_parser()
+    args = parser.parse_args(["download", "--manifest", "x.csv", "--workers", "8"])
+    assert args.workers == 8
+
+
+def test_workers_flag_defaults_to_none():
+    parser = build_parser()
+    args = parser.parse_args(["download", "--manifest", "x.csv"])
+    assert args.workers is None
+
+
+def test_workers_config_from_yaml(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("workers: 8\n", encoding="utf-8")
+    config = load_config(project_root=tmp_path, config_path=config_file)
+    assert config.workers == 8
+
+
+def test_workers_config_defaults_to_four(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("timeout_sec: 60\n", encoding="utf-8")
+    config = load_config(project_root=tmp_path, config_path=config_file)
+    assert config.workers == 4
